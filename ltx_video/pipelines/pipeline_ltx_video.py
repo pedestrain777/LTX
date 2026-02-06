@@ -1166,6 +1166,69 @@ class LTXVideoPipeline(DiffusionPipeline):
                 # default: ema
                 return self._ema
 
+        # --- helper: select keyframes (same as WAN) ---
+        def _select_keyframes(ent_1d: torch.Tensor, k: int, cover: bool = True):
+            f_lat = int(ent_1d.numel())
+            if k <= 0:
+                return torch.arange(f_lat, device=ent_1d.device)
+            k = min(k, f_lat)
+            idx = torch.topk(ent_1d, k=k, largest=True).indices
+
+            if cover and f_lat >= 2 and k >= 2:
+                must = torch.tensor([0, f_lat - 1], device=ent_1d.device)
+                idx = torch.unique(torch.cat([idx, must], dim=0))
+
+                if idx.numel() > k:
+                    mask = torch.ones(f_lat, device=ent_1d.device, dtype=torch.bool)
+                    mask[must] = False
+                    remain_k = max(0, k - must.numel())
+                    if remain_k > 0:
+                        remain = torch.topk(ent_1d[mask], k=remain_k).indices
+                        remain_idx = torch.arange(f_lat, device=ent_1d.device)[mask][remain]
+                        idx = torch.unique(torch.cat([must, remain_idx], dim=0))
+                    else:
+                        idx = must
+
+                if idx.numel() < k:
+                    need = k - idx.numel()
+                    buckets = torch.linspace(0, f_lat - 1, steps=need + 2, device=ent_1d.device)[1:-1].round().long()
+                    idx = torch.unique(torch.cat([idx, buckets], dim=0))
+
+            return idx.sort().values
+
+        # --- helper: build nonkey summary tokens for extra_kv ---
+        @torch.no_grad()
+        def _build_nonkey_summary(nonkey_latents, nonkey_pixel_coords, t_scale: int):
+            # nonkey_latents: [B, S, Cin], nonkey_pixel_coords: [B, 3, S]
+            hs = self.transformer.patchify_proj(nonkey_latents.to(self.transformer.dtype))  # [B,S,D]
+            fids = (nonkey_pixel_coords[:, 0, :] // t_scale).long()  # [B,S]
+
+            # assume B==1 for now; multi-batch can be added later
+            fid0 = fids[0]
+            hs0 = hs[0]  # [S,D]
+            uniq = torch.unique(fid0).sort().values
+            out = []
+            for u in uniq.tolist():
+                m = fid0 == u
+                out.append(hs0[m].mean(dim=0, keepdim=True))  # [1,D]
+            return torch.cat(out, dim=0).unsqueeze(0).contiguous()  # [1,F_nonkey,D]
+
+        # --- helper: TeaCache indicator (lightweight) ---
+        @torch.no_grad()
+        def _teacache_indicator(nonkey_latents, nonkey_pixel_coords, current_timestep_1d, t_scale: int):
+            # mean token embedding + timestep embedding (WAN-like)
+            hs = self.transformer.patchify_proj(nonkey_latents.to(self.transformer.dtype))  # [B,S,D]
+            v = hs.mean(dim=1)  # [B,D]
+
+            # get timestep embedding from AdaLN-single (same module transformer uses)
+            ts, _emb = self.transformer.adaln_single(
+                current_timestep_1d.flatten(),
+                {"resolution": None, "aspect_ratio": None},
+                batch_size=v.shape[0],
+                hidden_dtype=hs.dtype,
+            )  # ts: [B,D]
+            return (v + ts).float()  # [B,D] float32
+
         entropy_collector = _EntropyCollector(entropy_ema_alpha)
         pruned = False
         keyframe_ids = None  # will be torch.LongTensor[k]
@@ -1189,34 +1252,9 @@ class LTXVideoPipeline(DiffusionPipeline):
                 do_spatio_temporal_guidance = stg_scale[i] > 0
                 do_rescaling = rescaling_scale[i] != 1.0
 
-                num_conds = 1
-                if do_classifier_free_guidance:
-                    num_conds += 1
-                if do_spatio_temporal_guidance:
-                    num_conds += 1
-
-                if do_classifier_free_guidance and do_spatio_temporal_guidance:
-                    indices = slice(batch_size * 0, batch_size * 3)
-                elif do_classifier_free_guidance:
-                    indices = slice(batch_size * 0, batch_size * 2)
-                elif do_spatio_temporal_guidance:
-                    indices = slice(batch_size * 1, batch_size * 3)
-                else:
-                    indices = slice(batch_size * 1, batch_size * 2)
-
-                # Prepare skip layer masks
-                skip_layer_mask: Optional[torch.Tensor] = None
-                if do_spatio_temporal_guidance:
-                    if skip_block_list is not None:
-                        skip_layer_mask = self.transformer.create_skip_layer_mask(
-                            batch_size, num_conds, num_conds - 1, skip_block_list[i]
-                        )
-
-                batch_pixel_coords = torch.cat([pixel_coords] * num_conds)
+                # pixel_coords: [B,3,S]; convert to fractional coords for transformer
+                batch_pixel_coords = pixel_coords
                 conditioning_mask = orig_conditioning_mask
-                if conditioning_mask is not None and is_video:
-                    assert num_images_per_prompt == 1
-                    conditioning_mask = torch.cat([conditioning_mask] * num_conds)
                 fractional_coords = batch_pixel_coords.to(torch.float32)
                 fractional_coords[:, 0] = fractional_coords[:, 0] * (1.0 / frame_rate)
 
@@ -1230,12 +1268,8 @@ class LTXVideoPipeline(DiffusionPipeline):
                         generator,
                     )
 
-                latent_model_input = (
-                    torch.cat([latents] * num_conds) if num_conds > 1 else latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
+                # scale model input once per step (Rectified Flow style)
+                latent_model_input = self.scheduler.scale_model_input(latents, t)
 
                 current_timestep = t
                 if not torch.is_tensor(current_timestep):
@@ -1256,9 +1290,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                         latent_model_input.device
                     )
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                current_timestep = current_timestep.expand(
-                    latent_model_input.shape[0]
-                ).unsqueeze(-1)
+                current_timestep = current_timestep.expand(batch_size).unsqueeze(-1)
 
                 if conditioning_mask is not None:
                     # Conditioning latents have an initial timestep and noising level of (1.0 - conditioning_mask)
@@ -1273,65 +1305,266 @@ class LTXVideoPipeline(DiffusionPipeline):
                 else:
                     context_manager = nullcontext()  # Dummy context manager
 
-                # predict noise model_output
+                # === A) build continuous frame ids for entropy & nonkey summary ===
+                t_scale = int(get_vae_size_scale_factor(self.vae)[0])
+                token_frame_ids = (pixel_coords[:, 0, :] // t_scale).long()  # [B,S]
+
+                # === B) if already pruned: update non-key latents (interval / TeaCache) ===
+                extra_kv = None
+                if pruned and use_nonkey_context and (nonkey_latents is not None):
+                    if nonkey_update_mode in ("interval", "teacache"):
+                        need_update = False
+                        if nonkey_update_mode == "interval":
+                            need_update = (i % int(nonkey_update_interval) == 0)
+                        else:
+                            # TeaCache mode
+                            if teacache_warm < int(teacache_warmup):
+                                need_update = True
+                                teacache_warm += 1
+                            else:
+                                ind_now = _teacache_indicator(
+                                    nonkey_latents,
+                                    nonkey_pixel_coords,
+                                    current_timestep[:1],
+                                    t_scale,
+                                )
+                                if nonkey_ind_prev is None:
+                                    need_update = True
+                                else:
+                                    rel_l1 = (ind_now - nonkey_ind_prev).abs().mean() / (
+                                        nonkey_ind_prev.abs().mean() + 1e-8
+                                    )
+                                    if (rel_l1.item() >= float(teacache_rel_l1_thresh)) or (
+                                        teacache_skip >= int(teacache_max_skip)
+                                    ):
+                                        need_update = True
+                                    else:
+                                        teacache_skip += 1
+
+                        if need_update:
+                            teacache_skip = 0
+
+                            nk_coords = nonkey_pixel_coords
+                            nk_frac = nk_coords.to(torch.float32)
+                            nk_frac[:, 0] = nk_frac[:, 0] * (1.0 / frame_rate)
+
+                            nk_ct = current_timestep[:1].clone()
+                            if nonkey_conditioning_mask is not None:
+                                nk_ct = torch.min(nk_ct, 1.0 - nonkey_conditioning_mask)
+
+                            # slices in prompt_embeds_batch: [neg, pos, pos]
+                            B = batch_size
+                            sl_neg = slice(0, B)
+                            sl_pos = slice(B, 2 * B)
+                            sl_ptb = slice(2 * B, 3 * B)
+
+                            with context_manager:
+                                # text (positive) branch
+                                noise_pos_nk = self.transformer(
+                                    nonkey_latents.to(self.transformer.dtype),
+                                    indices_grid=nk_frac,
+                                    encoder_hidden_states=prompt_embeds_batch[sl_pos].to(
+                                        self.transformer.dtype
+                                    ),
+                                    encoder_attention_mask=prompt_attention_mask_batch[sl_pos],
+                                    timestep=nk_ct,
+                                    skip_layer_mask=None,
+                                    skip_layer_strategy=skip_layer_strategy,
+                                    cross_attention_kwargs=None,
+                                    return_dict=False,
+                                )[0]
+
+                                # uncond (only if CFG)
+                                if do_classifier_free_guidance:
+                                    noise_neg_nk = self.transformer(
+                                        nonkey_latents.to(self.transformer.dtype),
+                                        indices_grid=nk_frac,
+                                        encoder_hidden_states=prompt_embeds_batch[sl_neg].to(
+                                            self.transformer.dtype
+                                        ),
+                                        encoder_attention_mask=prompt_attention_mask_batch[sl_neg],
+                                        timestep=nk_ct,
+                                        skip_layer_mask=None,
+                                        skip_layer_strategy=skip_layer_strategy,
+                                        cross_attention_kwargs=None,
+                                        return_dict=False,
+                                    )[0]
+                                    noise_nk = noise_neg_nk + guidance_scale[i] * (
+                                        noise_pos_nk - noise_neg_nk
+                                    )
+                                else:
+                                    noise_nk = noise_pos_nk
+
+                                # STG perturb if enabled
+                                if do_spatio_temporal_guidance:
+                                    ptb_mask = None
+                                    if skip_block_list is not None:
+                                        ptb_mask = self.transformer.create_skip_layer_mask(
+                                            batch_size=1,
+                                            num_conds=1,
+                                            ptb_index=0,
+                                            skip_block_list=skip_block_list[i],
+                                        )
+                                    noise_ptb_nk = self.transformer(
+                                        nonkey_latents.to(self.transformer.dtype),
+                                        indices_grid=nk_frac,
+                                        encoder_hidden_states=prompt_embeds_batch[sl_ptb].to(
+                                            self.transformer.dtype
+                                        ),
+                                        encoder_attention_mask=prompt_attention_mask_batch[sl_ptb],
+                                        timestep=nk_ct,
+                                        skip_layer_mask=ptb_mask,
+                                        skip_layer_strategy=skip_layer_strategy,
+                                        cross_attention_kwargs=None,
+                                        return_dict=False,
+                                    )[0]
+                                    noise_nk = noise_nk + stg_scale[i] * (
+                                        noise_pos_nk - noise_ptb_nk
+                                    )
+
+                            # denoise nonkey latents with same scheduler
+                            nonkey_latents = self.denoising_step(
+                                nonkey_latents,
+                                noise_nk,
+                                nk_ct,
+                                nonkey_conditioning_mask,
+                                t,
+                                extra_step_kwargs,
+                                stochastic_sampling=stochastic_sampling,
+                            )
+
+                            # refresh summary + indicator
+                            nonkey_summary = _build_nonkey_summary(
+                                nonkey_latents, nonkey_pixel_coords, t_scale
+                            ).detach()
+                            if nonkey_update_mode == "teacache":
+                                nonkey_ind_prev = _teacache_indicator(
+                                    nonkey_latents,
+                                    nonkey_pixel_coords,
+                                    current_timestep[:1],
+                                    t_scale,
+                                ).detach()
+
+                    # even if mode == none, still can use frozen summary created at prune time
+                    if nonkey_summary is not None:
+                        extra_kv = nonkey_summary
+
+                # === C) main forward: split text / uncond / perturb, entropy ONLY on text ===
+                # build per-call cross-attention kwargs
+                ca_kwargs_base: Dict[str, Any] = {}
+                if extra_kv is not None:
+                    ca_kwargs_base["extra_kv"] = extra_kv
+
+                collect_entropy = keyframe_by_entropy and (not pruned) and (i < int(entropy_steps))
+                if collect_entropy:
+                    entropy_collector.enabled = True
+                    ca_kwargs_ent = dict(ca_kwargs_base)
+                    ca_kwargs_ent.update(
+                        {
+                            "entropy_collector": entropy_collector,
+                            "token_frame_ids": token_frame_ids,
+                            "entropy_block_idx": int(entropy_block_idx),
+                        }
+                    )
+                else:
+                    entropy_collector.enabled = False
+                    ca_kwargs_ent = None
+
+                B = batch_size
+                sl_neg = slice(0, B)
+                sl_pos = slice(B, 2 * B)
+                sl_ptb = slice(2 * B, 3 * B)
+
                 with context_manager:
-                    noise_pred = self.transformer(
+                    # positive (text) branch — entropy only here
+                    noise_pos = self.transformer(
                         latent_model_input.to(self.transformer.dtype),
-                        indices_grid=fractional_coords,
-                        encoder_hidden_states=prompt_embeds_batch[indices].to(
+                        indices_grid=fractional_coords[:B],
+                        encoder_hidden_states=prompt_embeds_batch[sl_pos].to(
                             self.transformer.dtype
                         ),
-                        encoder_attention_mask=prompt_attention_mask_batch[indices],
-                        timestep=current_timestep,
-                        skip_layer_mask=skip_layer_mask,
+                        encoder_attention_mask=prompt_attention_mask_batch[sl_pos],
+                        timestep=current_timestep[:B],
+                        skip_layer_mask=None,
                         skip_layer_strategy=skip_layer_strategy,
+                        cross_attention_kwargs=ca_kwargs_ent
+                        if collect_entropy
+                        else (ca_kwargs_base or None),
                         return_dict=False,
                     )[0]
+                    entropy_collector.enabled = False
 
-                # perform guidance
-                if do_spatio_temporal_guidance:
-                    noise_pred_text, noise_pred_text_perturb = noise_pred.chunk(
-                        num_conds
-                    )[-2:]
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(num_conds)[:2]
+                    # negative (uncond)
+                    if do_classifier_free_guidance:
+                        noise_neg = self.transformer(
+                            latent_model_input.to(self.transformer.dtype),
+                            indices_grid=fractional_coords[:B],
+                            encoder_hidden_states=prompt_embeds_batch[sl_neg].to(
+                                self.transformer.dtype
+                            ),
+                            encoder_attention_mask=prompt_attention_mask_batch[sl_neg],
+                            timestep=current_timestep[:B],
+                            skip_layer_mask=None,
+                            skip_layer_strategy=skip_layer_strategy,
+                            cross_attention_kwargs=ca_kwargs_base or None,
+                            return_dict=False,
+                        )[0]
+                        noise_pred = noise_neg + guidance_scale[i] * (noise_pos - noise_neg)
+                    else:
+                        noise_pred = noise_pos
 
-                    if cfg_star_rescale:
-                        # Rescales the unconditional noise prediction using the projection of the conditional prediction onto it:
-                        # α = (⟨ε_text, ε_uncond⟩ / ||ε_uncond||²), then ε_uncond ← α * ε_uncond
-                        # where ε_text is the conditional noise prediction and ε_uncond is the unconditional one.
-                        positive_flat = noise_pred_text.view(batch_size, -1)
-                        negative_flat = noise_pred_uncond.view(batch_size, -1)
-                        dot_product = torch.sum(
-                            positive_flat * negative_flat, dim=1, keepdim=True
-                        )
-                        squared_norm = (
-                            torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
-                        )
-                        alpha = dot_product / squared_norm
-                        noise_pred_uncond = alpha * noise_pred_uncond
+                    # STG perturb branch
+                    if do_spatio_temporal_guidance:
+                        ptb_mask = None
+                        if skip_block_list is not None:
+                            ptb_mask = self.transformer.create_skip_layer_mask(
+                                batch_size=1,
+                                num_conds=1,
+                                ptb_index=0,
+                                skip_block_list=skip_block_list[i],
+                            )
+                        noise_ptb = self.transformer(
+                            latent_model_input.to(self.transformer.dtype),
+                            indices_grid=fractional_coords[:B],
+                            encoder_hidden_states=prompt_embeds_batch[sl_ptb].to(
+                                self.transformer.dtype
+                            ),
+                            encoder_attention_mask=prompt_attention_mask_batch[sl_ptb],
+                            timestep=current_timestep[:B],
+                            skip_layer_mask=ptb_mask,
+                            skip_layer_strategy=skip_layer_strategy,
+                            cross_attention_kwargs=ca_kwargs_base or None,
+                            return_dict=False,
+                        )[0]
+                        noise_pred = noise_pred + stg_scale[i] * (noise_pos - noise_ptb)
 
-                    noise_pred = noise_pred_uncond + guidance_scale[i] * (
-                        noise_pred_text - noise_pred_uncond
+                # optional CFG* rescale (works on text/uncond pair)
+                if do_classifier_free_guidance and cfg_star_rescale:
+                    positive_flat = noise_pos.view(batch_size, -1)
+                    negative_flat = noise_neg.view(batch_size, -1)
+                    dot_product = torch.sum(
+                        positive_flat * negative_flat, dim=1, keepdim=True
                     )
-                elif do_spatio_temporal_guidance:
-                    noise_pred = noise_pred_text
-                if do_spatio_temporal_guidance:
-                    noise_pred = noise_pred + stg_scale[i] * (
-                        noise_pred_text - noise_pred_text_perturb
+                    squared_norm = (
+                        torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
                     )
-                    if do_rescaling and stg_scale[i] > 0.0:
-                        noise_pred_text_std = noise_pred_text.view(batch_size, -1).std(
-                            dim=1, keepdim=True
-                        )
-                        noise_pred_std = noise_pred.view(batch_size, -1).std(
-                            dim=1, keepdim=True
-                        )
+                    alpha = dot_product / squared_norm
+                    noise_neg = alpha * noise_neg
+                    noise_pred = noise_neg + guidance_scale[i] * (noise_pos - noise_neg)
 
-                        factor = noise_pred_text_std / noise_pred_std
-                        factor = rescaling_scale[i] * factor + (1 - rescaling_scale[i])
+                # STG rescaling (keep as before)
+                if do_spatio_temporal_guidance and do_rescaling and stg_scale[i] > 0.0:
+                    noise_pred_text_std = noise_pos.view(batch_size, -1).std(
+                        dim=1, keepdim=True
+                    )
+                    noise_pred_std = noise_pred.view(batch_size, -1).std(
+                        dim=1, keepdim=True
+                    )
 
-                        noise_pred = noise_pred * factor.view(batch_size, 1, 1)
+                    factor = noise_pred_text_std / noise_pred_std
+                    factor = rescaling_scale[i] * factor + (1 - rescaling_scale[i])
+
+                    noise_pred = noise_pred * factor.view(batch_size, 1, 1)
 
                 current_timestep = current_timestep[:1]
                 # learned sigma
@@ -1351,6 +1584,73 @@ class LTXVideoPipeline(DiffusionPipeline):
                     extra_step_kwargs,
                     stochastic_sampling=stochastic_sampling,
                 )
+
+                # === D) prune by entropy after the last entropy-collection step ===
+                if keyframe_by_entropy and (not pruned) and (i == int(entropy_steps) - 1):
+                    ent = entropy_collector.final(entropy_mode)
+                    if ent is not None:
+                        ent_1d = ent[0]  # [F]
+                        keyframe_ids = _select_keyframes(
+                            ent_1d, int(keyframe_topk), cover=bool(keyframe_cover)
+                        )
+
+                        # snapshot full tensors for building non-key tensors
+                        latents_full = latents.detach()
+                        pixel_coords_full = pixel_coords.detach()
+                        init_latents_full = init_latents.detach()
+                        orig_mask_full = (
+                            orig_conditioning_mask.detach()
+                            if orig_conditioning_mask is not None
+                            else None
+                        )
+
+                        # build token-level keep mask: keep cond prefix + key frames
+                        fid_full = (pixel_coords[:, 0, :] // t_scale).long()  # [B,S]
+                        keep = torch.zeros(
+                            fid_full.shape[1], device=latents.device, dtype=torch.bool
+                        )
+
+                        if num_cond_latents > 0:
+                            keep[:num_cond_latents] = True
+
+                        fid0 = fid_full[0]
+                        is_key = torch.isin(fid0, keyframe_ids)
+                        keep = keep | is_key
+
+                        # prune main tensors
+                        latents = latents[:, keep]
+                        pixel_coords = pixel_coords[:, :, keep]
+                        init_latents = init_latents[:, keep]
+                        if orig_conditioning_mask is not None:
+                            orig_conditioning_mask = orig_conditioning_mask[:, keep]
+
+                        # create non-key tensors (exclude conditioning prefix)
+                        nonkeep = (~keep).clone()
+                        if num_cond_latents > 0:
+                            nonkeep[:num_cond_latents] = False
+
+                        nonkey_latents = latents_full[:, nonkeep].detach()
+                        nonkey_pixel_coords = pixel_coords_full[:, :, nonkeep].detach()
+                        nonkey_init_latents = init_latents_full[:, nonkeep].detach()
+                        nonkey_conditioning_mask = (
+                            orig_mask_full[:, nonkeep].detach()
+                            if orig_mask_full is not None
+                            else None
+                        )
+
+                        # init nonkey summary + TeaCache state
+                        nonkey_summary = (
+                            _build_nonkey_summary(
+                                nonkey_latents, nonkey_pixel_coords, t_scale
+                            ).detach()
+                            if (use_nonkey_context and nonkey_latents.numel() > 0)
+                            else None
+                        )
+                        nonkey_ind_prev = None
+                        teacache_skip = 0
+                        teacache_warm = 0
+
+                        pruned = True
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (

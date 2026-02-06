@@ -32,3 +32,20 @@ second_pass:
   num_inference_steps: 30
   skip_initial_inference_steps: 17
   cfg_star_rescale: true
+
+# ==== 这里是你要新增的 WAN 风格关键帧 & nonkey 配置 ====
+keyframe_by_entropy: true         # 打开关键帧裁剪
+entropy_steps: 5                  # 前 5 步收集 attention entropy
+entropy_mode: "mean"              # 或 "ema" / "last"
+entropy_ema_alpha: 0.6
+entropy_block_idx: -1             # -1 表示最后一层 block
+keyframe_topk: 16                 # 选多少个关键帧（latent 帧）
+keyframe_cover: true              # 保证首/尾帧覆盖
+use_nonkey_context: true          # 裁剪后用 nonkey summary 做 extra_kv 上下文
+
+nonkey_update_mode: "teacache"    # "none" / "interval" / "teacache"
+nonkey_update_interval: 5
+teacache_rel_l1_thresh: 0.02
+teacache_max_skip: 8
+teacache_warmup: 2
+# ===========================================
