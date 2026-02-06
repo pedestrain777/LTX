@@ -941,6 +941,7 @@ class Attention(nn.Module):
 # [PATCH] Entropy helpers
 # =========================
 
+
 def _framewise_k_mean(
     k: torch.Tensor,  # [B, H, S, D]
     token_frame_ids: torch.Tensor,  # [B, S] int
@@ -1097,7 +1098,9 @@ class AttnProcessor2_0:
         # ==========================================================
         # [PATCH] optional nonkey extra context: append to K/V only
         # ==========================================================
-        extra_kv = kwargs.get("extra_kv", None)  # [B, extra_seq, C] in hidden-state space
+        extra_kv = kwargs.get(
+            "extra_kv", None
+        )  # [B, extra_seq, C] in hidden-state space
         if extra_kv is not None:
             # project extra kv
             extra_key = attn.to_k(extra_kv)

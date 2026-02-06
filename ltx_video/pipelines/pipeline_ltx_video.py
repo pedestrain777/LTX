@@ -44,7 +44,6 @@ from ltx_video.models.autoencoders.vae_encode import (
     normalize_latents,
 )
 
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -1187,14 +1186,22 @@ class LTXVideoPipeline(DiffusionPipeline):
                     remain_k = max(0, k - must.numel())
                     if remain_k > 0:
                         remain = torch.topk(ent_1d[mask], k=remain_k).indices
-                        remain_idx = torch.arange(f_lat, device=ent_1d.device)[mask][remain]
+                        remain_idx = torch.arange(f_lat, device=ent_1d.device)[mask][
+                            remain
+                        ]
                         idx = torch.unique(torch.cat([must, remain_idx], dim=0))
                     else:
                         idx = must
 
                 if idx.numel() < k:
                     need = k - idx.numel()
-                    buckets = torch.linspace(0, f_lat - 1, steps=need + 2, device=ent_1d.device)[1:-1].round().long()
+                    buckets = (
+                        torch.linspace(
+                            0, f_lat - 1, steps=need + 2, device=ent_1d.device
+                        )[1:-1]
+                        .round()
+                        .long()
+                    )
                     idx = torch.unique(torch.cat([idx, buckets], dim=0))
 
             return idx.sort().values
@@ -1203,7 +1210,9 @@ class LTXVideoPipeline(DiffusionPipeline):
         @torch.no_grad()
         def _build_nonkey_summary(nonkey_latents, nonkey_pixel_coords, t_scale: int):
             # nonkey_latents: [B, S, Cin], nonkey_pixel_coords: [B, 3, S]
-            hs = self.transformer.patchify_proj(nonkey_latents.to(self.transformer.dtype))  # [B,S,D]
+            hs = self.transformer.patchify_proj(
+                nonkey_latents.to(self.transformer.dtype)
+            )  # [B,S,D]
             fids = (nonkey_pixel_coords[:, 0, :] // t_scale).long()  # [B,S]
 
             # assume B==1 for now; multi-batch can be added later
@@ -1218,9 +1227,13 @@ class LTXVideoPipeline(DiffusionPipeline):
 
         # --- helper: TeaCache indicator (lightweight) ---
         @torch.no_grad()
-        def _teacache_indicator(nonkey_latents, nonkey_pixel_coords, current_timestep_1d, t_scale: int):
+        def _teacache_indicator(
+            nonkey_latents, nonkey_pixel_coords, current_timestep_1d, t_scale: int
+        ):
             # mean token embedding + timestep embedding (WAN-like)
-            hs = self.transformer.patchify_proj(nonkey_latents.to(self.transformer.dtype))  # [B,S,D]
+            hs = self.transformer.patchify_proj(
+                nonkey_latents.to(self.transformer.dtype)
+            )  # [B,S,D]
             v = hs.mean(dim=1)  # [B,D]
 
             # get timestep embedding from AdaLN-single (same module transformer uses)
@@ -1320,7 +1333,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                     if nonkey_update_mode in ("interval", "teacache"):
                         need_update = False
                         if nonkey_update_mode == "interval":
-                            need_update = (i % int(nonkey_update_interval) == 0)
+                            need_update = i % int(nonkey_update_interval) == 0
                         else:
                             # TeaCache mode
                             if teacache_warm < int(teacache_warmup):
@@ -1336,12 +1349,14 @@ class LTXVideoPipeline(DiffusionPipeline):
                                 if nonkey_ind_prev is None:
                                     need_update = True
                                 else:
-                                    rel_l1 = (ind_now - nonkey_ind_prev).abs().mean() / (
+                                    rel_l1 = (
+                                        ind_now - nonkey_ind_prev
+                                    ).abs().mean() / (
                                         nonkey_ind_prev.abs().mean() + 1e-8
                                     )
-                                    if (rel_l1.item() >= float(teacache_rel_l1_thresh)) or (
-                                        teacache_skip >= int(teacache_max_skip)
-                                    ):
+                                    if (
+                                        rel_l1.item() >= float(teacache_rel_l1_thresh)
+                                    ) or (teacache_skip >= int(teacache_max_skip)):
                                         need_update = True
                                     else:
                                         teacache_skip += 1
@@ -1373,10 +1388,12 @@ class LTXVideoPipeline(DiffusionPipeline):
                                 noise_pos_nk = self.transformer(
                                     nonkey_model_input.to(self.transformer.dtype),
                                     indices_grid=nk_frac,
-                                    encoder_hidden_states=prompt_embeds_batch[sl_pos].to(
-                                        self.transformer.dtype
-                                    ),
-                                    encoder_attention_mask=prompt_attention_mask_batch[sl_pos],
+                                    encoder_hidden_states=prompt_embeds_batch[
+                                        sl_pos
+                                    ].to(self.transformer.dtype),
+                                    encoder_attention_mask=prompt_attention_mask_batch[
+                                        sl_pos
+                                    ],
                                     timestep=nk_ct,
                                     skip_layer_mask=None,
                                     skip_layer_strategy=skip_layer_strategy,
@@ -1389,10 +1406,12 @@ class LTXVideoPipeline(DiffusionPipeline):
                                     noise_neg_nk = self.transformer(
                                         nonkey_model_input.to(self.transformer.dtype),
                                         indices_grid=nk_frac,
-                                        encoder_hidden_states=prompt_embeds_batch[sl_neg].to(
-                                            self.transformer.dtype
-                                        ),
-                                        encoder_attention_mask=prompt_attention_mask_batch[sl_neg],
+                                        encoder_hidden_states=prompt_embeds_batch[
+                                            sl_neg
+                                        ].to(self.transformer.dtype),
+                                        encoder_attention_mask=prompt_attention_mask_batch[
+                                            sl_neg
+                                        ],
                                         timestep=nk_ct,
                                         skip_layer_mask=None,
                                         skip_layer_strategy=skip_layer_strategy,
@@ -1409,19 +1428,23 @@ class LTXVideoPipeline(DiffusionPipeline):
                                 if do_spatio_temporal_guidance:
                                     ptb_mask = None
                                     if skip_block_list is not None:
-                                        ptb_mask = self.transformer.create_skip_layer_mask(
-                                            batch_size=1,
-                                            num_conds=1,
-                                            ptb_index=0,
-                                            skip_block_list=skip_block_list[i],
+                                        ptb_mask = (
+                                            self.transformer.create_skip_layer_mask(
+                                                batch_size=1,
+                                                num_conds=1,
+                                                ptb_index=0,
+                                                skip_block_list=skip_block_list[i],
+                                            )
                                         )
                                     noise_ptb_nk = self.transformer(
                                         nonkey_model_input.to(self.transformer.dtype),
                                         indices_grid=nk_frac,
-                                        encoder_hidden_states=prompt_embeds_batch[sl_ptb].to(
-                                            self.transformer.dtype
-                                        ),
-                                        encoder_attention_mask=prompt_attention_mask_batch[sl_ptb],
+                                        encoder_hidden_states=prompt_embeds_batch[
+                                            sl_ptb
+                                        ].to(self.transformer.dtype),
+                                        encoder_attention_mask=prompt_attention_mask_batch[
+                                            sl_ptb
+                                        ],
                                         timestep=nk_ct,
                                         skip_layer_mask=ptb_mask,
                                         skip_layer_strategy=skip_layer_strategy,
@@ -1465,7 +1488,9 @@ class LTXVideoPipeline(DiffusionPipeline):
                 if extra_kv is not None:
                     ca_kwargs_base["extra_kv"] = extra_kv
 
-                collect_entropy = keyframe_by_entropy and (not pruned) and (i < int(entropy_steps))
+                collect_entropy = (
+                    keyframe_by_entropy and (not pruned) and (i < int(entropy_steps))
+                )
                 if collect_entropy:
                     entropy_collector.enabled = True
                     ca_kwargs_ent = dict(ca_kwargs_base)
@@ -1497,9 +1522,11 @@ class LTXVideoPipeline(DiffusionPipeline):
                         timestep=current_timestep[:B],
                         skip_layer_mask=None,
                         skip_layer_strategy=skip_layer_strategy,
-                        cross_attention_kwargs=ca_kwargs_ent
-                        if collect_entropy
-                        else (ca_kwargs_base or None),
+                        cross_attention_kwargs=(
+                            ca_kwargs_ent
+                            if collect_entropy
+                            else (ca_kwargs_base or None)
+                        ),
                         return_dict=False,
                     )[0]
                     entropy_collector.enabled = False
@@ -1519,7 +1546,9 @@ class LTXVideoPipeline(DiffusionPipeline):
                             cross_attention_kwargs=ca_kwargs_base or None,
                             return_dict=False,
                         )[0]
-                        noise_pred = noise_neg + guidance_scale[i] * (noise_pos - noise_neg)
+                        noise_pred = noise_neg + guidance_scale[i] * (
+                            noise_pos - noise_neg
+                        )
                     else:
                         noise_pred = noise_pos
 
@@ -1596,7 +1625,11 @@ class LTXVideoPipeline(DiffusionPipeline):
                 )
 
                 # === D) prune by entropy after the last entropy-collection step ===
-                if keyframe_by_entropy and (not pruned) and (i == int(entropy_steps) - 1):
+                if (
+                    keyframe_by_entropy
+                    and (not pruned)
+                    and (i == int(entropy_steps) - 1)
+                ):
                     ent = entropy_collector.final(entropy_mode)
                     if ent is not None:
                         ent_1d = ent[0]  # [F]
