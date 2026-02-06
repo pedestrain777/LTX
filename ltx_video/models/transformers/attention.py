@@ -932,6 +932,74 @@ class Attention(nn.Module):
         return out
 
 
+# =========================
+# [PATCH] Entropy helpers
+# =========================
+
+def _framewise_k_mean(
+    k: torch.Tensor,  # [B, H, S, D]
+    token_frame_ids: torch.Tensor,  # [B, S] int
+    num_frames: int,
+) -> torch.Tensor:
+    """
+    Compute per-frame mean key: k_frame[b,h,f,d] = mean_{s in frame f} k[b,h,s,d]
+    """
+    B, H, S, D = k.shape
+    device = k.device
+    # sums: [B,H,F,D], counts: [B,1,F,1]
+    sums = torch.zeros((B, H, num_frames, D), device=device, dtype=k.dtype)
+    counts = torch.zeros((B, 1, num_frames, 1), device=device, dtype=k.dtype)
+
+    # frame ids: [B,1,S,1] expand to heads and D
+    fids = token_frame_ids.view(B, 1, S, 1).expand(B, H, S, 1)
+
+    sums.scatter_add_(2, fids.expand(B, H, S, D), k)
+    counts.scatter_add_(
+        2,
+        fids[:, :1].expand(B, 1, S, 1),
+        torch.ones((B, 1, S, 1), device=device, dtype=k.dtype),
+    )
+
+    return sums / counts.clamp_min(1.0)
+
+
+def _collect_frame_entropy_from_qk(
+    q: torch.Tensor,  # [B,H,S,D]
+    k: torch.Tensor,  # [B,H,S,D]
+    token_frame_ids: torch.Tensor,  # [B,S]
+    attn_scale: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Approx temporal attention entropy (token->frame):
+      1) Compute k_frame = mean key per frame
+      2) token logits over frames: logits[b,h,s,f] = <q[b,h,s], k_frame[b,h,f]> * scale
+      3) entropy over f, then aggregate token entropies to per-frame by token_frame_ids
+    Return: frame_entropy [B, F]
+    """
+    with torch.no_grad():
+        B, H, S, D = q.shape
+        num_frames = int(token_frame_ids.max().item()) + 1
+
+        k_frame = _framewise_k_mean(k, token_frame_ids, num_frames)  # [B,H,F,D]
+
+        # logits: [B,H,S,F]
+        logits = torch.einsum("bhsd,bhfd->bhsf", q, k_frame) * attn_scale
+        probs = torch.softmax(logits, dim=-1)  # over frames
+        ent = -(probs * torch.log(probs.clamp_min(eps))).sum(dim=-1)  # [B,H,S]
+        ent_tok = ent.mean(dim=1)  # avg over heads -> [B,S]
+
+        # aggregate token entropy to per-frame
+        out = torch.zeros((B, num_frames), device=q.device, dtype=ent_tok.dtype)
+        cnt = torch.zeros((B, num_frames), device=q.device, dtype=ent_tok.dtype)
+
+        fids = token_frame_ids  # [B,S]
+        out.scatter_add_(1, fids, ent_tok)
+        cnt.scatter_add_(1, fids, torch.ones_like(ent_tok))
+        out = out / cnt.clamp_min(1.0)
+        return out
+
+
 class AttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
@@ -1020,6 +1088,70 @@ class AttnProcessor2_0:
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # ==========================================================
+        # [PATCH] optional nonkey extra context: append to K/V only
+        # ==========================================================
+        extra_kv = kwargs.get("extra_kv", None)  # [B, extra_seq, C] in hidden-state space
+        if extra_kv is not None:
+            # project extra kv
+            extra_key = attn.to_k(extra_kv)
+            extra_key = attn.k_norm(extra_key)
+            extra_val = attn.to_v(extra_kv)
+
+            extra_key = extra_key.view(batch_size, -1, attn.heads, head_dim).transpose(
+                1,
+                2,
+            )  # [B,H,extra,D]
+            extra_val = extra_val.view(batch_size, -1, attn.heads, head_dim).transpose(
+                1,
+                2,
+            )  # [B,H,extra,D]
+
+            # concat to key/value along seq dim
+            key = torch.cat([extra_key, key], dim=2)
+            value = torch.cat([extra_val, value], dim=2)
+            # NOTE: attention_mask not extended here; assume None or already compatible.
+
+        # ==========================================================
+        # [PATCH] Attention entropy collection (self-attn only)
+        # Insert right AFTER q/k/value reshape, BEFORE attention call
+        # ==========================================================
+        entropy_collector = kwargs.get("entropy_collector", None)
+        token_frame_ids = kwargs.get("token_frame_ids", None)  # [B,S]
+        block_idx = kwargs.get("block_idx", None)
+        entropy_block_idx = kwargs.get("entropy_block_idx", -2)  # default: disabled
+
+        # Only collect on self-attn (encoder_hidden_states is None path)
+        if (
+            entropy_collector is not None
+            and getattr(entropy_collector, "enabled", False)
+            and token_frame_ids is not None
+            and (encoder_hidden_states is hidden_states)  # self-attn
+        ):
+            if (entropy_block_idx == -1) or (
+                block_idx is not None and block_idx == entropy_block_idx
+            ):
+                # q/k here are [B,H,S,D]
+                # IMPORTANT: if extra_kv is used, key includes extra part.
+                # For entropy we only want original video tokens, so compute using the original key/value BEFORE extra concat.
+                # We handle this by recomputing with q and the tail of key corresponding to original S tokens.
+                if extra_kv is not None:
+                    # key has [extra + S]; keep last S
+                    k_for_ent = key[:, :, -token_frame_ids.shape[1] :, :]
+                    q_for_ent = query[:, :, : token_frame_ids.shape[1], :]
+                else:
+                    k_for_ent = key
+                    q_for_ent = query
+
+                frame_ent = _collect_frame_entropy_from_qk(
+                    q=q_for_ent,
+                    k=k_for_ent,
+                    token_frame_ids=token_frame_ids,
+                    attn_scale=attn.scale,
+                )  # [B,F]
+
+                entropy_collector.add(frame_ent)
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
 

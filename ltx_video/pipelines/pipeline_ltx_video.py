@@ -791,6 +791,22 @@ class LTXVideoPipeline(DiffusionPipeline):
         stochastic_sampling: bool = False,
         media_items: Optional[torch.Tensor] = None,
         tone_map_compression_ratio: float = 0.0,
+        # =========================
+        # [PATCH] WAN-style early-prune + nonkey update
+        # =========================
+        keyframe_by_entropy: bool = False,
+        entropy_steps: int = 5,
+        entropy_mode: str = "ema",  # {"ema","mean","last"}
+        entropy_ema_alpha: float = 0.6,
+        entropy_block_idx: int = -1,  # -1 means last block
+        keyframe_topk: int = 16,
+        keyframe_cover: bool = True,
+        use_nonkey_context: bool = False,
+        nonkey_update_mode: str = "none",  # {"none","interval","teacache"}
+        nonkey_update_interval: int = 5,
+        teacache_rel_l1_thresh: float = 0.02,
+        teacache_max_skip: int = 8,
+        teacache_warmup: int = 2,
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         """
@@ -1105,6 +1121,62 @@ class LTXVideoPipeline(DiffusionPipeline):
         )
 
         orig_conditioning_mask = conditioning_mask
+
+        # ======================================================
+        # [PATCH] Minimal entropy collector (WAN-like behavior)
+        # ======================================================
+        class _EntropyCollector:
+            def __init__(self, ema_alpha: float = 0.6):
+                self.enabled = False
+                self.ema_alpha = float(ema_alpha)
+                self._ema = None
+                self._sum = None
+                self._cnt = 0
+                self._last = None
+
+            def reset(self):
+                self._ema = None
+                self._sum = None
+                self._cnt = 0
+                self._last = None
+
+            def add(self, frame_ent: torch.Tensor):
+                # frame_ent: [B,F]
+                self._last = frame_ent.detach()
+                if self._sum is None:
+                    self._sum = frame_ent.detach().clone()
+                else:
+                    self._sum = self._sum + frame_ent.detach()
+                self._cnt += 1
+
+                if self._ema is None:
+                    self._ema = frame_ent.detach().clone()
+                else:
+                    a = self.ema_alpha
+                    self._ema = a * self._ema + (1.0 - a) * frame_ent.detach()
+
+            def final(self, mode: str):
+                if self._last is None:
+                    return None
+                mode = str(mode).lower()
+                if mode == "last":
+                    return self._last
+                if mode == "mean":
+                    return self._sum / max(self._cnt, 1)
+                # default: ema
+                return self._ema
+
+        entropy_collector = _EntropyCollector(entropy_ema_alpha)
+        pruned = False
+        keyframe_ids = None  # will be torch.LongTensor[k]
+        nonkey_latents = None
+        nonkey_pixel_coords = None
+        nonkey_init_latents = None
+        nonkey_conditioning_mask = None
+        nonkey_summary = None
+        nonkey_ind_prev = None
+        teacache_skip = 0
+        teacache_warm = 0
 
         # Befor compiling this code please be aware:
         # This code might generate different input shapes if some timesteps have no STG or CFG.

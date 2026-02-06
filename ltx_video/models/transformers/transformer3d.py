@@ -442,6 +442,15 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             )
 
         for block_idx, block in enumerate(self.transformer_blocks):
+            # ======================================================
+            # [PATCH] inject block_idx into cross_attention_kwargs
+            # ======================================================
+            if cross_attention_kwargs is None:
+                ca_kwargs = {}
+            else:
+                ca_kwargs = cross_attention_kwargs.copy()
+            ca_kwargs["block_idx"] = block_idx
+
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
@@ -464,7 +473,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states,
                     encoder_attention_mask,
                     timestep,
-                    cross_attention_kwargs,
+                    ca_kwargs,
                     class_labels,
                     (
                         skip_layer_mask[block_idx]
@@ -482,7 +491,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     timestep=timestep,
-                    cross_attention_kwargs=cross_attention_kwargs,
+                    cross_attention_kwargs=ca_kwargs,
                     class_labels=class_labels,
                     skip_layer_mask=(
                         skip_layer_mask[block_idx]

@@ -166,3 +166,34 @@ outputs/
 *.mp4
 *.png
 !tests/utils/car.png
+
+# --------------- 模型权重格式 ---------------
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.h5
+*.pb
+*.onnx
+*.safetensors
+
+# --------------- 存放模型的目录 ---------------
+models/
+checkpoints/
+weights/
+flolpips/weights/
+
+# --------------- 输出目录 ---------------
+output/
+results/
+logs/
+interpolation_outputs/
+*.log
+
+# --------------- 数据集目录 ---------------
+dataset/
+data/
+
+# --------------- 其他临时文件 -------------
+*.tmp
+*.swp
