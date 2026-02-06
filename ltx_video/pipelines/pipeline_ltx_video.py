@@ -1237,7 +1237,6 @@ class LTXVideoPipeline(DiffusionPipeline):
         keyframe_ids = None  # will be torch.LongTensor[k]
         nonkey_latents = None
         nonkey_pixel_coords = None
-        nonkey_init_latents = None
         nonkey_conditioning_mask = None
         nonkey_summary = None
         nonkey_ind_prev = None
@@ -1608,7 +1607,6 @@ class LTXVideoPipeline(DiffusionPipeline):
                         # snapshot full tensors for building non-key tensors
                         latents_full = latents.detach()
                         pixel_coords_full = pixel_coords.detach()
-                        init_latents_full = init_latents.detach()
                         orig_mask_full = (
                             orig_conditioning_mask.detach()
                             if orig_conditioning_mask is not None
