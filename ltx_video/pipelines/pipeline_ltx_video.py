@@ -1631,7 +1631,6 @@ class LTXVideoPipeline(DiffusionPipeline):
 
                         nonkey_latents = latents_full[:, nonkeep].detach()
                         nonkey_pixel_coords = pixel_coords_full[:, :, nonkeep].detach()
-                        nonkey_init_latents = init_latents_full[:, nonkeep].detach()
                         nonkey_conditioning_mask = (
                             orig_mask_full[:, nonkeep].detach()
                             if orig_mask_full is not None
