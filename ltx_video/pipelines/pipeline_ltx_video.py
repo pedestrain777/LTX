@@ -965,6 +965,9 @@ class LTXVideoPipeline(DiffusionPipeline):
             **retrieve_timesteps_kwargs,
         )
 
+        # Clamp entropy_steps to available timesteps (WAN-like behavior)
+        entropy_steps = min(int(entropy_steps), len(timesteps))
+
         if self.allowed_inference_steps is not None:
             for timestep in [round(x, 4) for x in timesteps.tolist()]:
                 assert (
@@ -1292,6 +1295,9 @@ class LTXVideoPipeline(DiffusionPipeline):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 current_timestep = current_timestep.expand(batch_size).unsqueeze(-1)
 
+                # Save a base timestep (before token-wise clamping) for non-key path
+                timestep_base = current_timestep
+
                 if conditioning_mask is not None:
                     # Conditioning latents have an initial timestep and noising level of (1.0 - conditioning_mask)
                     # and will start to be denoised when the current timestep is lower than their conditioning timestep.
@@ -1325,7 +1331,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                                 ind_now = _teacache_indicator(
                                     nonkey_latents,
                                     nonkey_pixel_coords,
-                                    current_timestep[:1],
+                                    timestep_base[:1],
                                     t_scale,
                                 )
                                 if nonkey_ind_prev is None:
@@ -1348,7 +1354,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                             nk_frac = nk_coords.to(torch.float32)
                             nk_frac[:, 0] = nk_frac[:, 0] * (1.0 / frame_rate)
 
-                            nk_ct = current_timestep[:1].clone()
+                            nk_ct = timestep_base[:1].clone()
                             if nonkey_conditioning_mask is not None:
                                 nk_ct = torch.min(nk_ct, 1.0 - nonkey_conditioning_mask)
 
@@ -1358,10 +1364,15 @@ class LTXVideoPipeline(DiffusionPipeline):
                             sl_pos = slice(B, 2 * B)
                             sl_ptb = slice(2 * B, 3 * B)
 
+                            # scale nonkey latents in the same way as main branch
+                            nonkey_model_input = self.scheduler.scale_model_input(
+                                nonkey_latents, t
+                            )
+
                             with context_manager:
                                 # text (positive) branch
                                 noise_pos_nk = self.transformer(
-                                    nonkey_latents.to(self.transformer.dtype),
+                                    nonkey_model_input.to(self.transformer.dtype),
                                     indices_grid=nk_frac,
                                     encoder_hidden_states=prompt_embeds_batch[sl_pos].to(
                                         self.transformer.dtype
@@ -1377,7 +1388,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                                 # uncond (only if CFG)
                                 if do_classifier_free_guidance:
                                     noise_neg_nk = self.transformer(
-                                        nonkey_latents.to(self.transformer.dtype),
+                                        nonkey_model_input.to(self.transformer.dtype),
                                         indices_grid=nk_frac,
                                         encoder_hidden_states=prompt_embeds_batch[sl_neg].to(
                                             self.transformer.dtype
@@ -1406,7 +1417,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                                             skip_block_list=skip_block_list[i],
                                         )
                                     noise_ptb_nk = self.transformer(
-                                        nonkey_latents.to(self.transformer.dtype),
+                                        nonkey_model_input.to(self.transformer.dtype),
                                         indices_grid=nk_frac,
                                         encoder_hidden_states=prompt_embeds_batch[sl_ptb].to(
                                             self.transformer.dtype

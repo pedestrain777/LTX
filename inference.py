@@ -1,11 +1,13 @@
 import os
 
-from transformers import HfArgumentParser
-
-from ltx_video.inference import infer, InferenceConfig
-
 # 使用 HuggingFace 镜像，解决国内连接 huggingface.co 超时问题
+# IMPORTANT: must be set before importing transformers/huggingface_hub.
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_ENDPOINT", "https://hf-mirror.com")
+
+from transformers import HfArgumentParser  # noqa: E402
+
+from ltx_video.inference import infer, InferenceConfig  # noqa: E402
 
 
 def main():

@@ -694,17 +694,22 @@ class Attention(nn.Module):
         attn_parameters = set(
             inspect.signature(self.processor.__call__).parameters.keys()
         )
-        unused_kwargs = [
-            k for k, _ in cross_attention_kwargs.items() if k not in attn_parameters
-        ]
-        if len(unused_kwargs) > 0:
-            logger.warning(
-                f"cross_attention_kwargs {unused_kwargs} are not expected by"
-                f" {self.processor.__class__.__name__} and will be ignored."
-            )
-        cross_attention_kwargs = {
-            k: w for k, w in cross_attention_kwargs.items() if k in attn_parameters
-        }
+        # 如果 processor.__call__ 没有 **kwargs（即没有名为 "kwargs" 的参数），
+        # 则保持原有行为：对未知 key 打 warning 并过滤掉；否则认为它可以安全接收
+        # 额外字段（例如 entropy_collector / token_frame_ids / block_idx 等），
+        # 不再打印 warning，也不做过滤。
+        if "kwargs" not in attn_parameters:
+            unused_kwargs = [
+                k for k, _ in cross_attention_kwargs.items() if k not in attn_parameters
+            ]
+            if len(unused_kwargs) > 0:
+                logger.warning(
+                    f"cross_attention_kwargs {unused_kwargs} are not expected by"
+                    f" {self.processor.__class__.__name__} and will be ignored."
+                )
+            cross_attention_kwargs = {
+                k: w for k, w in cross_attention_kwargs.items() if k in attn_parameters
+            }
 
         return self.processor(
             self,
